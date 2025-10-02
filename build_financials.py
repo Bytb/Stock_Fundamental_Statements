@@ -13,6 +13,8 @@ Spec:
 - Negatives with parentheses; missing as em dash (—)
 - Source traceability per column: filing date + accession (SEC link)
 - Abort if <2 years usable
+pip install certifi==2025.8.3 charset-normalizer==3.4.3 edgar==5.6.3 et_xmlfile==2.0.0 idna==3.10 lxml==6.0.2 numpy==2.3.3 openpyxl==3.1.5 pandas==2.3.3 python-dateutil==2.9.0.post0 pytz==2025.2 RapidFuzz==3.14.1 requests==2.32.5 six==1.17.0 tqdm==4.67.1 tzdata==2025.2 urllib3==2.5.0
+
 """
 
 from __future__ import annotations
@@ -21,9 +23,11 @@ import warnings
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 
 import pandas as pd
 from dateutil.parser import parse as parse_date
+from tqdm import tqdm
 
 # edgartools
 from edgar import Company, MultiFinancials, set_identity
@@ -88,6 +92,7 @@ CONCEPT_GROUPS: Dict[str, List[str]] = {
         "us-gaap:Revenues",
         "us-gaap:SalesRevenueNet",
         "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+        "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax",  # NEW
     ],
     "Cost of Goods Sold": [
         "us-gaap:CostOfRevenue",
@@ -198,6 +203,9 @@ CONCEPT_GROUPS: Dict[str, List[str]] = {
     ],
     "Capital Expenditures": [
         "us-gaap:PaymentsToAcquirePropertyPlantAndEquipment",
+        "us-gaap:CapitalExpenditures",                                      # NEW
+        "us-gaap:PaymentsToAcquireProductiveAssets",                        # NEW
+        "us-gaap:PaymentsToAcquirePropertyPlantAndEquipmentAndIntangibleAssets",  # NEW
     ],
     "Net Cash from Investing Activities": [
         "us-gaap:NetCashProvidedByUsedInInvestingActivities",
@@ -222,6 +230,10 @@ ALIASES = {
     "Revenue from contracts with customers": "Revenue",
     "Revenue from contracts with customers, excluding assessed taxes": "Revenue",
     "Revenues before reimbursements (“Net revenues”)": "Revenue",
+    "Net revenues": "Revenue",
+    "Revenue from contract with customer including assessed tax": "Revenue",
+    "Revenue from contracts with customers, including assessed taxes": "Revenue",
+    "Gross margin": "Gross Profit",
 
     "Cost of Revenue": "Cost of Goods Sold",
     "Cost of Goods and Services Sold": "Cost of Goods Sold",
@@ -327,6 +339,13 @@ ALIASES = {
 
     "Depreciation, amortization and other": "Depreciation and Amortization",
     "Depreciation, amortization and asset impairments": "Depreciation and Amortization",
+
+    "Property and equipment additions": "Capital Expenditures",
+    "PPE additions": "Capital Expenditures",
+    "PP&E additions": "Capital Expenditures",
+    "Capital investments": "Capital Expenditures",
+    "Capital additions": "Capital Expenditures",
+    "Purchases of PPE": "Capital Expenditures",
 }
 
 # Items that are per-share or counts (do not scale)
@@ -421,56 +440,64 @@ def _build_canonical_from_raw(df_raw: pd.DataFrame, condensed_order: List[str]) 
         # alias → target
         if target is None and label in ALIASES:
             target = ALIASES[label]
-        # keyword fallback
+        # keyword fallback (slightly expanded)
         if target is None:
             low = label.lower()
-            if "revenue" in low:
+
+            # ----- income basics -----
+            if "revenue" in low or "net revenues" in low:
                 target = "Revenue"
-            elif "cost" in low and ("revenue" in low or "services" in low or "goods" in low):
+            elif ("cost of revenue" in low) or ("cost of goods" in low) or ("cost of services" in low):
                 target = "Cost of Goods Sold"
-            elif "gross profit" in low:
+            elif "gross profit" in low or "gross margin" in low:
                 target = "Gross Profit"
-            elif "research" in low and "development" in low:
+            elif ("research" in low and "development" in low) or "r&d" in low:
                 target = "Research and Development"
-            elif "selling" in low and "administr" in low:
+            elif ("selling" in low and "administr" in low) or "sg&a" in low or "sga" in low:
                 target = "Selling, General and Administrative"
-            elif "operating" in low and "income" in low:
+            elif ("operating" in low and "income" in low) or ("income from operations" in low):
                 target = "Operating Income"
-            elif "other" in low and "income" in low:
+            elif ("other" in low and "income" in low and "expense" in low) or ("nonoperating" in low):
                 target = "Non-Operating Income (Expense)"
-            elif "before" in low and "income" in low and "tax" in low:
+            elif ("before" in low and "income" in low and "tax" in low) or ("before tax" in low):
                 target = "Income Before Tax"
-            elif "income tax" in low or "provision for income taxes" in low:
+            elif "income tax expense" in low or "provision for income taxes" in low:
                 target = "Income Tax Expense"
-            elif low.startswith("net income"):
+            elif low.startswith("net income") or low.startswith("net loss") or "net earnings" in low:
                 target = "Net Income"
             elif "earnings per share" in low and "basic" in low:
                 target = "Basic EPS"
             elif "earnings per share" in low and "diluted" in low:
                 target = "Diluted EPS"
-            elif "shares" in low and "basic" in low:
+            elif "weighted average" in low and "basic" in low and "share" in low:
                 target = "Basic Shares Outstanding"
-            elif "shares" in low and "diluted" in low:
+            elif "weighted average" in low and "diluted" in low and "share" in low:
                 target = "Diluted Shares Outstanding"
+
+            # ----- balance basics -----
             elif "property" in low and "plant" in low:
                 target = "Property, Plant & Equipment (Net)"
             elif "accounts receivable" in low:
                 target = "Accounts Receivable"
-            elif "inventory" in low:
+            elif "inventor" in low:  # inventory / inventories
                 target = "Inventory"
             elif "accounts payable" in low:
                 target = "Accounts Payable"
-            elif "short term debt" in low or "short-term debt" in low:
+            elif "short term debt" in low or "short-term debt" in low or "debt, current" in low:
                 target = "Short-term Debt"
-            elif "liabilities and stockholders' equity" in low or "liabilities and shareholders’ equity" in low:
+            elif ("liabilities and stockholders' equity" in low
+                  or "liabilities and shareholders’ equity" in low
+                  or "liabilities and equity" in low):
                 target = "Total Liabilities and Equity"
-            elif "liabilities current" in low:
+            elif "liabilities current" in low or low.strip() == "total current liabilities":
                 target = "Total Current Liabilities"
-            elif "long-term debt" in low:
+            elif "long-term debt" in low or "long term debt" in low or "debt, noncurrent" in low:
                 target = "Long-term Debt"
-            elif low == "total liabilities":
+            elif low.strip() == "total liabilities":
                 target = "Total Liabilities"
-            elif "stockholders’ equity" in low or "stockholders' equity" in low:
+            elif ("stockholders’ equity" in low or "stockholders' equity" in low
+                  or "shareholders’ equity" in low or "shareholders' equity" in low
+                  or low.strip() == "total equity"):
                 target = "Total Equity"
             elif "goodwill" in low or "intangible" in low:
                 target = "Goodwill and Intangibles"
@@ -478,18 +505,29 @@ def _build_canonical_from_raw(df_raw: pd.DataFrame, condensed_order: List[str]) 
                 target = "Cash and Cash Equivalents"
             elif "marketable securities" in low or "short-term investments" in low:
                 target = "Short-term Investments"
-            elif "assets current" in low:
+            elif "assets current" in low or low.strip() == "total current assets":
                 target = "Total Current Assets"
-            elif low == "assets":
+            elif low.strip() == "assets" or low.strip() == "total assets":
                 target = "Total Assets"
-            elif "net cash" in low and "operating" in low:
+
+            # ----- cash flow basics -----
+            elif ("net cash" in low and "operating" in low):
                 target = "Net Cash from Operating Activities"
-            elif "net cash" in low and "investing" in low:
+            elif ("net cash" in low and "investing" in low):
                 target = "Net Cash from Investing Activities"
-            elif "net cash" in low and "financing" in low:
+            elif ("net cash" in low and "financing" in low):
                 target = "Net Cash from Financing Activities"
-            elif "net change" in low and "cash" in low:
+            elif (("net increase" in low or "net decrease" in low or "net change" in low) and "cash" in low):
                 target = "Net Change in Cash"
+
+            # CapEx: common phrasings
+            elif (
+                    ("payments" in low or "purchases" in low or "additions" in low)
+                    and ("property" in low or "plant" in low or "equipment" in low or "pp&e" in low or "ppe" in low)
+            ) or ("capital investments" in low) or ("capital additions" in low):
+                target = "Capital Expenditures"
+
+            # D&A (helps EBITDA if present anywhere)
             elif "depreciation" in low and "amort" in low:
                 target = "Depreciation and Amortization"
 
@@ -667,6 +705,10 @@ def _filter_usd_or_abort(mf: MultiFinancials):
 # ----------------------------- Main builder -----------------------------
 
 def build_workbook_for_ticker(ticker: str) -> str:
+
+    OUT_DATA_DIR = Path("raw_data")  # or an absolute path if you want
+    OUT_DATA_DIR.mkdir(exist_ok=True)  # creates folder if it doesn’t exist
+
     ticker = ticker.strip().upper()
     company = Company(ticker)
     cik = str(getattr(company, "cik", "") or getattr(company, "cik_str", "") or "").lstrip("0")
@@ -693,16 +735,18 @@ def build_workbook_for_ticker(ticker: str) -> str:
 
     newest_year = parse_date(cols_order[0]).year
     oldest_year = parse_date(cols_order[-1]).year
-    out_name = f"{ticker}_{newest_year}-{oldest_year}.xlsx"
+    out_name = OUT_DATA_DIR / f"{ticker}_{newest_year}-{oldest_year}.xlsx"
 
     meta_by_period = _gather_filing_meta(mf, cik=cik)
 
     with pd.ExcelWriter(out_name, engine="openpyxl") as xw:
-        for title, df_fmt, scale_label in [
+        sheets = [
             ("Income Statement", inc_fmt, inc_scale),
-            ("Balance Sheet",   bal_fmt, bal_scale),
-            ("Cash Flow",       cf_fmt,  cf_scale),
-        ]:
+            ("Balance Sheet", bal_fmt, bal_scale),
+            ("Cash Flow", cf_fmt, cf_scale),
+        ]
+
+        for title, df_fmt, scale_label in tqdm(sheets, desc="Writing sheets"):
             # Write table at row 2 (note at row 1)
             df_fmt.to_excel(xw, sheet_name=title, startrow=1, index=True)
             ws = xw.book[title]
@@ -723,9 +767,10 @@ def build_workbook_for_ticker(ticker: str) -> str:
                 else:
                     filing_dates.append("")
                     accessions.append("")
-            trace_df = pd.DataFrame({"Filing Date": filing_dates,
-                                     "Accession (SEC link)": accessions},
-                                    index=df_fmt.columns).T
+            trace_df = pd.DataFrame(
+                {"Filing Date": filing_dates, "Accession (SEC link)": accessions},
+                index=df_fmt.columns
+            ).T
             trace_df.to_excel(xw, sheet_name=title, startrow=start_row, index=True)
 
     return out_name
